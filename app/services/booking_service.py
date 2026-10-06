@@ -1,5 +1,6 @@
 from datetime import date, time, datetime, timedelta
 from typing import List, Dict, Any, Tuple
+from zoneinfo import ZoneInfo
 from sqlalchemy import select, and_, func, desc
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +11,19 @@ from app.models.notification import Notification
 from app.schemas.appointment import CreateAppointmentRequest
 from app.core.exceptions import NotFoundException, BadRequestException, ConflictException, ForbiddenException
 
+# Availability times are Pakistan local; Vercel/UTC must not be used for "past".
+_PKT = ZoneInfo("Asia/Karachi")
+
+
 class BookingService:
+    @staticmethod
+    def _now_pkt() -> datetime:
+        return datetime.now(_PKT)
+
+    @staticmethod
+    def _today_pkt() -> date:
+        return datetime.now(_PKT).date()
+
     @staticmethod
     def _format_time_slot(t: time) -> str:
         dummy = datetime.combine(date(2000, 1, 1), t)
@@ -61,7 +74,10 @@ class BookingService:
 
     @staticmethod
     async def get_available_slots(session: AsyncSession, doctor_id: str, slot_date: date) -> Dict[str, Any]:
-        if slot_date < date.today():
+        today_pkt = BookingService._today_pkt()
+        now_pkt = BookingService._now_pkt()
+
+        if slot_date < today_pkt:
             return {"slots": [], "all_slots": []}
 
         # 1. Check doctor exists and is approved
@@ -110,31 +126,31 @@ class BookingService:
             )
         )
         booked_appts = (await session.execute(stmt_appts)).scalars().all()
-        now = datetime.now()
 
         available_slots: List[str] = []
         all_slots: List[Dict[str, Any]] = []
 
         for slot_start, slot_end in candidate_blocks:
-            slot_start_dt = datetime.combine(slot_date, slot_start)
-            slot_end_dt = datetime.combine(slot_date, slot_end)
+            # Treat stored clock times as Pakistan local.
+            slot_start_dt = datetime.combine(slot_date, slot_start, tzinfo=_PKT)
+            slot_end_dt = datetime.combine(slot_date, slot_end, tzinfo=_PKT)
+
+            # Skip slots that already started (cannot book).
+            if slot_date == today_pkt and slot_start_dt <= now_pkt:
+                continue
 
             is_booked = False
             for appt in booked_appts:
-                appt_start_dt = datetime.combine(slot_date, appt.start_time)
-                appt_end_dt = datetime.combine(slot_date, appt.end_time)
+                appt_start_dt = datetime.combine(slot_date, appt.start_time, tzinfo=_PKT)
+                appt_end_dt = datetime.combine(slot_date, appt.end_time, tzinfo=_PKT)
                 if slot_start_dt < appt_end_dt and slot_end_dt > appt_start_dt:
                     is_booked = True
                     break
 
-            is_past = (slot_date == date.today() and slot_start_dt <= now)
             formatted_time = BookingService._format_time_slot(slot_start)
 
             if is_booked:
                 slot_status = "booked"
-                is_available = False
-            elif is_past:
-                slot_status = "past"
                 is_available = False
             else:
                 slot_status = "available"
@@ -190,13 +206,14 @@ class BookingService:
         if doctor.status != "approved":
             raise BadRequestException("Doctor is not available for appointments")
 
-        # 3. Verify date and times
-        if data.appointment_date < date.today():
+        # 3. Verify date and times (Pakistan local clock)
+        today_pkt = BookingService._today_pkt()
+        now_pkt = BookingService._now_pkt()
+        if data.appointment_date < today_pkt:
             raise BadRequestException("Cannot book appointment in the past")
 
-        now = datetime.now()
-        req_start_dt = datetime.combine(data.appointment_date, data.start_time)
-        if data.appointment_date == date.today() and req_start_dt <= now:
+        req_start_dt = datetime.combine(data.appointment_date, data.start_time, tzinfo=_PKT)
+        if data.appointment_date == today_pkt and req_start_dt <= now_pkt:
             raise BadRequestException("Cannot book a time slot that has already passed")
 
         day_name = data.appointment_date.strftime("%A")
